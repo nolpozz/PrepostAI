@@ -1,0 +1,4 @@
+Data/
+evaluation_results.json
+evaluation_summary.csv
+__pycache__/
