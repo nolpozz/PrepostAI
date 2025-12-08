@@ -211,6 +211,7 @@ Respond with JSON: {{"queries": ["query1", "query2"]}}"""
 # -----------------------------
 
 def nli_score(premise: str, hypothesis: str):
+    print(f"nli scoreing: {premise}, {hypothesis}")
     inputs = nli_tokenizer(premise, hypothesis, return_tensors="pt", truncation=True, max_length=512).to(device)
     outputs = nli_model(**inputs)
     probs = torch.softmax(outputs.logits, dim=-1).detach().cpu().numpy()[0]
@@ -362,7 +363,7 @@ Classify as: bullshit, not_bullshit, or contextually_ambiguous
 Respond with JSON:
 {{
   "classification": "...",
-  "confidence": "high/medium/low",
+  "confidence": "0.00-1.00",
   "reasoning": "...",
   "suggested_revision": "..."
 }}"""
@@ -423,6 +424,8 @@ def react_agent(state: BullshitState) -> BullshitState:
 Context so far: {accumulated_context if accumulated_context else "[None]"}
 
 Available tools: fetch_wikipedia, fetch_bbc, run_nli, assess (finish)
+
+If you have not gathered any NLI scores, you must do so.
 
 What should you do next? Respond with JSON:
 {{"action": "fetch_wikipedia", "query": "..."}} or {{"action": "assess"}}"""
@@ -499,11 +502,17 @@ Context: {ctx_for_prompt}
 
 Classify as: bullshit, not_bullshit, or contextually_ambiguous
 
+Classification should be contextually_ambiguous if the draft is sufficiently nuanced, if it can not be verified what they are talking about.
+Classification should be not_bullshit if the user is consistent with themselves, even if they disagree with the facts, as long as they are not in stark contradiction to the facts and are speaking beyond their knowledge
+Classification should be bullshit if the user contradicts themselves, if they do not seem to care that the reader takes the draft to be true or false, or if they are in stark contradiction to the facts, unless they are disagreeing with the facts explicitly.
+
+Grade continuously on the scale from 0.00-1.00 where 0.00 is no idea and 1.00 is absolute certainty.
+
 JSON response:
 {{
-  "classification": "...",
-  "confidence": "...",
   "reasoning": "...",
+  "classification": "...",
+  "confidence": "0.00-1.00",
   "suggested_revision": "..."
 }}"""
     
@@ -547,10 +556,16 @@ def inference_first(state: BullshitState) -> BullshitState:
 
 No external tools. Classify as: bullshit, not_bullshit, or contextually_ambiguous
 
+Classification should be contextually_ambiguous if the draft is sufficiently nuanced, if it can not be verified what they are talking about.
+Classification should be not_bullshit if the user is consistent with themselves, even if they disagree with the facts, as long as they are not in stark contradiction to the facts and are speaking beyond their knowledge
+Classification should be bullshit if the user contradicts themselves, if they do not seem to care that the reader takes the draft to be true or false, or if they are in stark contradiction to the facts, unless they are disagreeing with the facts explicitly.
+
+Grade continuously on the scale from 0.00-1.00 where 0.00 is no idea and 1.00 is absolute certainty.
+
 JSON response:
 {{
   "classification": "...",
-  "confidence": "...",
+  "confidence": "0.00-1.00",
   "reasoning": "...",
   "suggested_revision": "..."
 }}"""

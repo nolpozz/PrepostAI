@@ -625,7 +625,7 @@ Respond with JSON:
   "tweet_summary": "brief summary of the draft tweet",
   "context_summary": "brief summary of gathered context",
   "classification": "bullshit/not_bullshit/contextually_ambiguous",
-  "confidence": "high/medium/low",
+  "confidence": "0.00-1.00",
   "internal_contradictions": ["contradiction with user's post: ...", ...],
   "external_contradictions": [
     {{"claim": "...", "contradiction": "...", "source": "Wikipedia: ... or BBC: ..."}}
