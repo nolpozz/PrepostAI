@@ -70,6 +70,7 @@ def add_user_texts(user_id: str, texts: List[str]):
     user_data[user_id]["texts"].extend(texts)
 
 def retrieve_similar(user_id: str, draft: str, top_k: int = 5) -> List[str]:
+    """Retrieve similar texts from user history. Default top_k=5 but can be overridden."""
     if user_id not in user_data:
         return []
     idx = get_or_create_index(user_id)
@@ -201,6 +202,7 @@ Respond ONLY with JSON."""
 # -----------------------------
 
 def nli_score(premise: str, hypothesis: str):
+    """Run NLI model to get contradiction, neutral, and entailment scores."""
     print("in nli score")
     inputs = nli_tokenizer(premise, hypothesis, return_tensors="pt", truncation=True, max_length=512).to(device)
     outputs = nli_model(**inputs)
@@ -265,19 +267,6 @@ class BullshitState(TypedDict):
 # ============================================================================
 # 6. ABLATION 1: EVIDENCE-FIRST (Predefined Pipeline)
 # ============================================================================
-# DESIGN PRINCIPLE: Fixed sequence of verification steps
-# 
-# WORKFLOW:
-#   1. retrieve_node → Fetch user history + generate queries + search external sources
-#   2. nli_node → Run NLI contradiction detection on all gathered context
-#   3. assess_node → LLM makes final judgment with all context
-# 
-# KEY CHARACTERISTICS:
-#   - No dynamic decision-making by the agent
-#   - Always executes all steps in the same order
-#   - Uses LLM for query generation but not for workflow control
-#   - Predictable, deterministic pipeline
-# ============================================================================
 
 def evidence_first_retrieve_node(state: BullshitState) -> BullshitState:
     """
@@ -331,8 +320,11 @@ def nli_node(state: BullshitState) -> BullshitState:
             continue
         sc = nli_score(ctx, state["draft"])
         scores.append(sc)
-        if sc["contradiction"] > 0.6:
-            contradictions.append(ctx)
+        # Store all scores and context for later analysis - let LLM decide what's a contradiction
+        contradictions.append({
+            "context": ctx,
+            "scores": sc
+        })
     
     state["nli_scores"] = scores
     state["nli_contradictions"] = contradictions
@@ -346,7 +338,14 @@ def llm_assess_node(state: BullshitState) -> BullshitState:
     """
     print("[Evidence-First] Step 5: Final LLM assessment...")
     ctx_for_prompt = "\n".join(f"- {c[:300]}" for c in state["combined_contexts"][:10])
-    contradictions_list = "\n".join(f"- {c[:200]}" for c in state.get('nli_contradictions', [])[:5])
+    
+    # Format NLI results with scores
+    contradictions_list = ""
+    if state.get('nli_contradictions'):
+        contradictions_list = "\n".join(
+            f"- Context: {item['context'][:200]}...\n  Contradiction: {item['scores']['contradiction']:.3f}, Neutral: {item['scores']['neutral']:.3f}, Entailment: {item['scores']['entailment']:.3f}"
+            for item in state['nli_contradictions'][:5]
+        )
     
     prompt = f"""You are a fact-checking assistant analyzing a tweet draft.
 
@@ -359,20 +358,24 @@ User's Historical Context (previous posts):
 External Sources:
 {ctx_for_prompt}
 
-NLI Contradictions Found: {len(state.get('nli_contradictions', []))}
-{contradictions_list if contradictions_list else ""}
+NLI Analysis Results ({len(state.get('nli_contradictions', []))} items checked):
+{contradictions_list if contradictions_list else "No NLI analysis performed"}
 
 Analyze the draft and provide a comprehensive assessment:
 
 1. Classify as: "bullshit", "not_bullshit", or "contextually_ambiguous"
-   - bullshit: False, misleading, or overconfident claims
-   - not_bullshit: Accurate, grounded, well-supported statements
-   - contextually_ambiguous: Unclear, vague, or context-dependent
+   - not_bullshit: Draft is sufficiently nuanced, OR user is consistent with themselves, even if they disagree with facts, as long as they are not in stark contradiction to facts and are speaking beyond their knowledge
+   - contextually_ambiguous: Cannot be verified what they are talking about, or lacks sufficient context to make a determination
+   - bullshit: User contradicts themselves, or they do not seem to care that the reader takes the draft to be true or false, or they are in stark contradiction to facts (unless explicitly disagreeing with facts)
 
-2. Identify internal contradictions (with user's previous posts)
-3. Identify external contradictions (with factual sources - provide references)
-4. Assess confidence in your classification
-5. Provide reasoning
+2. Grade confidence continuously on scale from 0.00-1.00 where 0.00 is no idea and 1.00 is absolute certainty
+
+3. Identify internal contradictions (with user's previous posts)
+
+4. Identify external contradictions (with factual sources - provide references)
+
+5. Provide detailed reasoning
+
 6. Suggest a more grounded revision if needed
 
 Respond with JSON:
@@ -380,7 +383,7 @@ Respond with JSON:
   "tweet_summary": "brief summary of the draft tweet",
   "context_summary": "brief summary of gathered context",
   "classification": "bullshit/not_bullshit/contextually_ambiguous",
-  "confidence": "high/medium/low",
+  "confidence": "0.00-1.00",
   "internal_contradictions": ["contradiction with user's post: ...", ...],
   "external_contradictions": [
     {{"claim": "...", "contradiction": "...", "source": "Wikipedia: ... or BBC: ..."}}
@@ -398,7 +401,7 @@ Respond with JSON:
             "tweet_summary": raw[:200],
             "context_summary": "Parse failed",
             "classification": "unknown",
-            "confidence": "low",
+            "confidence": "0.00",
             "internal_contradictions": [],
             "external_contradictions": [],
             "reasoning": "Failed to parse response",
@@ -428,20 +431,6 @@ def build_evidence_first_graph():
 # ============================================================================
 # 7. ABLATION 2: REACT (Agent-Driven Tool Selection)
 # ============================================================================
-# DESIGN PRINCIPLE: Agent dynamically decides which tools to use and when
-# 
-# WORKFLOW:
-#   1. react_node → Agent iteratively decides: fetch_wikipedia | fetch_bbc | 
-#                   run_nli | assess (finish)
-#   2. assess_node → Final LLM assessment after agent finishes gathering
-# 
-# KEY CHARACTERISTICS:
-#   - Agent has full autonomy over tool selection
-#   - Can skip tools it deems unnecessary
-#   - Can stop early if confident in judgment
-#   - Workflow adapts to the specific claim being verified
-#   - More efficient but less predictable than Evidence-First
-# ============================================================================
 
 def react_agent_node(state: BullshitState) -> BullshitState:
     """
@@ -451,6 +440,7 @@ def react_agent_node(state: BullshitState) -> BullshitState:
     - fetch_wikipedia: Search Wikipedia for a topic
     - fetch_bbc: Search BBC news for a topic
     - run_nli: Check for contradictions
+    - retrieve_user_history: Fetch similar user posts (can specify top_k)
     - assess: Finish and make judgment
     
     Agent continues until it calls 'assess' or reaches max_rounds.
@@ -461,15 +451,13 @@ def react_agent_node(state: BullshitState) -> BullshitState:
     tool_log = state.get("tool_calls_made", [])
     failed_attempts = []  # Track failed attempts to avoid loops
     
-    # Always start with user history (baseline context)
-    print("[ReACT] Retrieving user history...")
-    user_contexts = retrieve_similar(user_id, draft, top_k=5)
-    accumulated_context.extend(user_contexts)
-    tool_log.append("retrieve_user_history")
+    # Start with empty context - agent must explicitly retrieve user history
+    print("[ReACT] Starting agent loop...")
+    user_contexts = []
     
-    max_rounds = 5
+    max_rounds = 8  # Increased from 5 to 8
     for round_idx in range(max_rounds):
-        print(f"\n[ReACT] Round {round_idx + 1}: Agent deciding next action...")
+        print(f"\n[ReACT] Round {round_idx + 1}/{max_rounds}: Agent deciding next action...")
         
         # Ask agent what to do next
         prompt = f"""You are a fact-checking agent verifying a tweet draft.
@@ -484,9 +472,10 @@ Tools used so far: {tool_log}
 Failed attempts: {failed_attempts if failed_attempts else "[None]"}
 
 Available tools:
+- retrieve_user_history: Get similar posts from user's history (optional: specify top_k, default=5)
 - fetch_wikipedia: Get Wikipedia summary for a topic
 - fetch_bbc: Get recent news articles
-- run_nli: Check for contradictions with existing context
+- run_nli: Check for contradiction between draft and a specific claim (must provide claim)
 - assess: Make final judgment and finish
 
 IMPORTANT: If a tool failed, try a different tool or query. Don't repeat failures.
@@ -494,9 +483,10 @@ IMPORTANT: If a tool failed, try a different tool or query. Don't repeat failure
 Decide what to do next. Respond with JSON:
 
 To use a tool:
+{{"action": "retrieve_user_history", "top_k": 5}}
 {{"action": "fetch_wikipedia", "query": "topic"}}
 {{"action": "fetch_bbc", "query": "topic"}}
-{{"action": "run_nli"}}
+{{"action": "run_nli", "claim": "specific claim from context to check against draft"}}
 
 To finish:
 {{"action": "assess"}}
@@ -527,7 +517,15 @@ Respond ONLY with JSON."""
                     break
         
         # Execute the chosen tool
-        if action == "fetch_wikipedia":
+        if action == "retrieve_user_history":
+            top_k = parsed.get("top_k", 5)
+            print(f"[ReACT] Retrieving user history (top_k={top_k})...")
+            user_contexts = retrieve_similar(user_id, draft, top_k=top_k)
+            print(f"[ReACT] Found {len(user_contexts)} relevant previous posts")
+            accumulated_context.extend(user_contexts)
+            tool_log.append(f"retrieve_user_history(top_k={top_k})")
+        
+        elif action == "fetch_wikipedia":
             query = parsed.get("query", " ".join(draft.split()[:3]))
             wiki = fetch_wikipedia(query)
             if wiki:
@@ -546,23 +544,35 @@ Respond ONLY with JSON."""
                 failed_attempts.append(attempt_key)
         
         elif action == "run_nli":
-            print("[ReACT] Running NLI...")
-            nli_contradictions = []
-            nli_scores = []
-            for ctx in accumulated_context:
-                if not ctx.strip():
-                    continue
-                sc = nli_score(ctx, draft)
+            # Agent must specify which claim to compare against the draft
+            claim_to_check = parsed.get("claim", "")
+            
+            if not claim_to_check:
+                print("[ReACT] ERROR: run_nli requires 'claim' parameter")
+                print("[ReACT] Agent must specify which previous post or document claim to check")
+                # Add error to context so agent knows
+                accumulated_context.append("NLI Error: Must specify a claim to check against draft")
+            else:
+                print(f"[ReACT] Running NLI between draft and: '{claim_to_check[:80]}...'")
+                
+                # Run NLI on just this one claim vs the draft
+                sc = nli_score(claim_to_check, draft)
+                
+                nli_contradictions = state.get("nli_contradictions", [])
+                nli_scores = state.get("nli_scores", [])
+                
                 nli_scores.append(sc)
-                if sc["contradiction"] > 0.6:
-                    nli_contradictions.append(ctx)
-            
-            state["nli_contradictions"] = nli_contradictions
-            state["nli_scores"] = nli_scores
-            tool_log.append("run_nli")
-            
-            # Add NLI results to context for agent's next decision
-            accumulated_context.append(f"NLI Analysis: Found {len(nli_contradictions)} contradictions")
+                nli_contradictions.append({
+                    "context": claim_to_check,
+                    "scores": sc
+                })
+                
+                print(f"   Contradiction: {sc['contradiction']:.3f}, Neutral: {sc['neutral']:.3f}, Entailment: {sc['entailment']:.3f}")
+                accumulated_context.append(f"NLI: '{claim_to_check[:100]}...' - Contradiction: {sc['contradiction']:.3f}, Neutral: {sc['neutral']:.3f}, Entailment: {sc['entailment']:.3f}")
+                
+                state["nli_contradictions"] = nli_contradictions
+                state["nli_scores"] = nli_scores
+                tool_log.append(f"run_nli({claim_to_check[:50]}...)")
         
         elif action == "assess":
             print("[ReACT] Agent decided to assess and finish.")
@@ -589,7 +599,14 @@ def react_assess_node(state: BullshitState) -> BullshitState:
     """Final assessment after ReACT tool selection."""
     print("[ReACT] Making final assessment...")
     ctx_for_prompt = "\n".join(f"- {c[:300]}" for c in state["combined_contexts"][:10])
-    contradictions_list = "\n".join(f"- {c[:200]}" for c in state.get('nli_contradictions', [])[:5])
+    
+    # Format NLI results with scores
+    nli_results_list = ""
+    if state.get('nli_contradictions'):
+        nli_results_list = "\n".join(
+            f"- Context: {item['context'][:200]}...\n  Contradiction: {item['scores']['contradiction']:.3f}, Neutral: {item['scores']['neutral']:.3f}, Entailment: {item['scores']['entailment']:.3f}"
+            for item in state['nli_contradictions'][:5]
+        )
     
     prompt = f"""You are a fact-checking assistant analyzing a tweet draft.
 
@@ -604,20 +621,24 @@ External Sources:
 
 Tools Used: {state.get('tool_calls_made', [])}
 
-NLI Contradictions Found: {len(state.get('nli_contradictions', []))}
-{contradictions_list if contradictions_list else ""}
+NLI Analysis Results ({len(state.get('nli_contradictions', []))} items checked):
+{nli_results_list if nli_results_list else "No NLI analysis performed"}
 
 Analyze the draft and provide a comprehensive assessment:
 
 1. Classify as: "bullshit", "not_bullshit", or "contextually_ambiguous"
-   - bullshit: False, misleading, or overconfident claims
-   - not_bullshit: Accurate, grounded, well-supported statements
-   - contextually_ambiguous: Unclear, vague, or context-dependent
+   - not_bullshit: Draft is sufficiently nuanced, OR user is consistent with themselves, even if they disagree with facts, as long as they are not in stark contradiction to facts and are speaking beyond their knowledge
+   - contextually_ambiguous: Cannot be verified what they are talking about, or lacks sufficient context to make a determination
+   - bullshit: User contradicts themselves, or they do not seem to care that the reader takes the draft to be true or false, or they are in stark contradiction to facts (unless explicitly disagreeing with facts)
 
-2. Identify internal contradictions (with user's previous posts)
-3. Identify external contradictions (with factual sources - provide references)
-4. Assess confidence in your classification
-5. Provide reasoning
+2. Grade confidence continuously on scale from 0.00-1.00 where 0.00 is no idea and 1.00 is absolute certainty
+
+3. Identify internal contradictions (with user's previous posts)
+
+4. Identify external contradictions (with factual sources - provide references)
+
+5. Provide detailed reasoning
+
 6. Suggest a more grounded revision if needed
 
 Respond with JSON:
@@ -643,7 +664,7 @@ Respond with JSON:
             "tweet_summary": raw[:200],
             "context_summary": "Parse failed",
             "classification": "unknown",
-            "confidence": "low",
+            "confidence": "0.00",
             "internal_contradictions": [],
             "external_contradictions": [],
             "reasoning": "Failed to parse response",
@@ -671,18 +692,6 @@ def build_react_graph():
 # ============================================================================
 # 8. ABLATION 3: INFERENCE-FIRST (Non-Agentic Baseline)
 # ============================================================================
-# DESIGN PRINCIPLE: No tools, no retrieval - pure LLM judgment
-# 
-# WORKFLOW:
-#   1. assess_node → LLM makes judgment based solely on internal knowledge
-# 
-# KEY CHARACTERISTICS:
-#   - No external verification
-#   - No user history retrieval
-#   - No NLI checking
-#   - Baseline to measure value of tools and retrieval
-#   - Fast but potentially unreliable
-# ============================================================================
 
 def inference_first_node(state: BullshitState) -> BullshitState:
     """Direct LLM judgment with no retrieval or tools."""
@@ -698,12 +707,14 @@ Draft Tweet:
 Without retrieving any external information or user history, assess:
 
 1. Classify as: "bullshit", "not_bullshit", or "contextually_ambiguous"
-   - bullshit: False, misleading, or overconfident claims
-   - not_bullshit: Accurate, grounded, well-supported statements
-   - contextually_ambiguous: Unclear, vague, or context-dependent
+   - not_bullshit: Draft is sufficiently nuanced, OR user is consistent with themselves, even if they disagree with facts, as long as they are not in stark contradiction to facts and are speaking beyond their knowledge
+   - contextually_ambiguous: Cannot be verified what they are talking about, or lacks sufficient context to make a determination
+   - bullshit: User contradicts themselves, or they do not seem to care that the reader takes the draft to be true or false, or they are in stark contradiction to facts (unless explicitly disagreeing with facts)
 
-2. Assess confidence in your classification
-3. Provide reasoning based on general knowledge
+2. Grade confidence continuously on scale from 0.00-1.00 where 0.00 is no idea and 1.00 is absolute certainty
+
+3. Provide detailed reasoning based on general knowledge
+
 4. Suggest a more grounded revision if needed
 
 Respond with JSON:
@@ -711,7 +722,7 @@ Respond with JSON:
   "tweet_summary": "brief summary of the draft tweet",
   "context_summary": "no external context used",
   "classification": "bullshit/not_bullshit/contextually_ambiguous",
-  "confidence": "high/medium/low",
+  "confidence": "0.00-1.00",
   "internal_contradictions": [],
   "external_contradictions": [],
   "reasoning": "detailed explanation based on internal knowledge",
@@ -728,7 +739,7 @@ Respond with JSON:
             "tweet_summary": raw[:200],
             "context_summary": "No external context",
             "classification": "unknown",
-            "confidence": "low",
+            "confidence": "0.00",
             "internal_contradictions": [],
             "external_contradictions": [],
             "reasoning": "Failed to parse response",
@@ -888,11 +899,25 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
         "contradiction_detected": 0,
         "contradiction_expected": 0,
         "avg_tool_calls": 0,
+        "total_latency_seconds": 0.0,
         "by_label": {
             "bullshit": {"correct": 0, "total": 0},
             "not_bullshit": {"correct": 0, "total": 0},
             "contextually_ambiguous": {"correct": 0, "total": 0}
-        }
+        },
+        "confusion_matrix": {
+            "predicted_bs_actual_bs": 0,
+            "predicted_bs_actual_not": 0,
+            "predicted_bs_actual_amb": 0,
+            "predicted_not_actual_bs": 0,
+            "predicted_not_actual_not": 0,
+            "predicted_not_actual_amb": 0,
+            "predicted_amb_actual_bs": 0,
+            "predicted_amb_actual_not": 0,
+            "predicted_amb_actual_amb": 0,
+        },
+        "confidence_correct": [],
+        "confidence_incorrect": [],
     }
     
     for idx, test_case in enumerate(test_cases, 1):
@@ -920,7 +945,11 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
         }
         
         try:
+            import time
+            start_time = time.time()
             result = graph.invoke(state0)
+            elapsed = time.time() - start_time
+            metrics["total_latency_seconds"] += elapsed
             
             # Extract predictions
             llm_resp = result.get("llm_response", {})
@@ -929,7 +958,7 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
                     "classification": "unknown",
                     "tweet_summary": llm_resp[:100],
                     "context_summary": "",
-                    "confidence": "low",
+                    "confidence": "0.00",
                     "internal_contradictions": [],
                     "external_contradictions": [],
                     "reasoning": "",
@@ -941,11 +970,36 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
             nli_contradictions = len(result.get("nli_contradictions", []))
             tool_calls = result.get("tool_calls_made", [])
             
+            # Parse confidence score
+            try:
+                confidence_raw = llm_resp.get("confidence", "0.00")
+                if isinstance(confidence_raw, str):
+                    confidence_value = float(confidence_raw)
+                else:
+                    confidence_value = float(confidence_raw)
+            except (ValueError, TypeError):
+                confidence_value = 0.0
+            
             # Check correctness
             is_correct = (predicted_label == expected_label)
             metrics["correct"] += int(is_correct)
             metrics["total"] += 1
             metrics["avg_tool_calls"] += len(tool_calls)
+            
+            # Track confidence by correctness
+            if is_correct:
+                metrics["confidence_correct"].append(confidence_value)
+            else:
+                metrics["confidence_incorrect"].append(confidence_value)
+            
+            # Update confusion matrix
+            pred_short = {"bullshit": "bs", "not_bullshit": "not", "contextually_ambiguous": "amb"}.get(predicted_label, "unknown")
+            actual_short = {"bullshit": "bs", "not_bullshit": "not", "contextually_ambiguous": "amb"}.get(expected_label, "unknown")
+            
+            if pred_short != "unknown" and actual_short != "unknown":
+                matrix_key = f"predicted_{pred_short}_actual_{actual_short}"
+                if matrix_key in metrics["confusion_matrix"]:
+                    metrics["confusion_matrix"][matrix_key] += 1
             
             # Track by label
             if expected_label in metrics["by_label"]:
@@ -964,8 +1018,9 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
                     metrics["contradiction_detected"] += 1
             
             # Display detailed results
+            confidence = llm_resp.get('confidence', '0.00')
             print(f"\n✓ Result: {predicted_label} (expected: {expected_label}) - {'✅ CORRECT' if is_correct else '❌ WRONG'}")
-            print(f"  Confidence: {llm_resp.get('confidence', 'unknown')}")
+            print(f"  Confidence: {confidence}")
             print(f"  Tweet Summary: {llm_resp.get('tweet_summary', 'N/A')[:1000]}")
             print(f"  Context Summary: {llm_resp.get('context_summary', 'N/A')[:1000]}")
             
@@ -993,6 +1048,8 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
                 "expected": expected_label,
                 "predicted": predicted_label,
                 "correct": is_correct,
+                "confidence": confidence_value,
+                "latency_seconds": elapsed,
                 "context_count": context_count,
                 "nli_contradictions": nli_contradictions,
                 "tool_calls": tool_calls,
@@ -1019,6 +1076,13 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
     contradiction_recall = (metrics["contradiction_detected"] / metrics["contradiction_expected"] 
                            if metrics["contradiction_expected"] > 0 else 0)
     avg_tools = metrics["avg_tool_calls"] / metrics["total"] if metrics["total"] > 0 else 0
+    avg_latency = metrics["total_latency_seconds"] / metrics["total"] if metrics["total"] > 0 else 0
+    
+    # Calculate confidence metrics
+    avg_confidence_correct = (sum(metrics["confidence_correct"]) / len(metrics["confidence_correct"]) 
+                             if metrics["confidence_correct"] else 0)
+    avg_confidence_incorrect = (sum(metrics["confidence_incorrect"]) / len(metrics["confidence_incorrect"]) 
+                               if metrics["confidence_incorrect"] else 0)
     
     # Calculate per-label accuracy
     label_accuracy = {}
@@ -1035,7 +1099,11 @@ def evaluate_system(system_name: str, graph, timeline_data: Dict[str, Any]) -> D
         "context_usage_rate": context_usage,
         "contradiction_recall": contradiction_recall,
         "avg_tool_calls": avg_tools,
+        "avg_latency_seconds": avg_latency,
+        "avg_confidence_correct": avg_confidence_correct,
+        "avg_confidence_incorrect": avg_confidence_incorrect,
         "label_accuracy": label_accuracy,
+        "confusion_matrix": metrics["confusion_matrix"],
         "metrics": metrics,
         "results": results
     }
@@ -1084,9 +1152,9 @@ def run_full_evaluation(data_dir: str = "data"):
     
     for user_id, timeline_results in all_results.items():
         print(f"\n📊 User: {user_id}")
-        print("-" * 80)
-        print(f"{'System':<35} {'Overall':<10} {'Bullshit':<12} {'Not BS':<12} {'Ambiguous':<12} {'Avg Tools'}")
-        print("-" * 80)
+        print("-" * 100)
+        print(f"{'System':<35} {'Overall':<10} {'Bullshit':<12} {'Not BS':<12} {'Ambiguous':<12} {'Avg Tools':<12} {'Latency'}")
+        print("-" * 100)
         
         for system_name, result in timeline_results.items():
             label_acc = result.get('label_accuracy', {})
@@ -1096,7 +1164,22 @@ def run_full_evaluation(data_dir: str = "data"):
             
             print(f"{system_name:<35} {result['accuracy']:>8.1%} "
                   f"{bs_acc:>10.1%} {not_bs_acc:>10.1%} {amb_acc:>10.1%} "
-                  f"{result['avg_tool_calls']:>10.1f}")
+                  f"{result['avg_tool_calls']:>10.1f} {result['avg_latency_seconds']:>10.2f}s")
+        
+        # Print confusion matrix for each system
+        print(f"\n📊 Confusion Matrices for {user_id}:")
+        for system_name, result in timeline_results.items():
+            cm = result.get('confusion_matrix', {})
+            print(f"\n{system_name}:")
+            print(f"                    Actual: BS    Not BS    Ambiguous")
+            print(f"  Predicted BS:     {cm.get('predicted_bs_actual_bs', 0):>6}    {cm.get('predicted_bs_actual_not', 0):>6}    {cm.get('predicted_bs_actual_amb', 0):>6}")
+            print(f"  Predicted Not BS: {cm.get('predicted_not_actual_bs', 0):>6}    {cm.get('predicted_not_actual_not', 0):>6}    {cm.get('predicted_not_actual_amb', 0):>6}")
+            print(f"  Predicted Amb:    {cm.get('predicted_amb_actual_bs', 0):>6}    {cm.get('predicted_amb_actual_not', 0):>6}    {cm.get('predicted_amb_actual_amb', 0):>6}")
+            
+            # Print confidence analysis
+            print(f"\n  Confidence Analysis:")
+            print(f"    Avg confidence (correct):   {result.get('avg_confidence_correct', 0):.3f}")
+            print(f"    Avg confidence (incorrect): {result.get('avg_confidence_incorrect', 0):.3f}")
     
     # Overall statistics
     print(f"\n\n{'='*80}")
@@ -1106,13 +1189,22 @@ def run_full_evaluation(data_dir: str = "data"):
     for system_name in systems.keys():
         all_accuracies = [r[system_name]['accuracy'] for r in all_results.values()]
         all_tool_counts = [r[system_name]['avg_tool_calls'] for r in all_results.values()]
+        all_latencies = [r[system_name]['avg_latency_seconds'] for r in all_results.values()]
+        all_conf_correct = [r[system_name]['avg_confidence_correct'] for r in all_results.values()]
+        all_conf_incorrect = [r[system_name]['avg_confidence_incorrect'] for r in all_results.values()]
         
         avg_accuracy = np.mean(all_accuracies) if all_accuracies else 0
         avg_tools = np.mean(all_tool_counts) if all_tool_counts else 0
+        avg_latency = np.mean(all_latencies) if all_latencies else 0
+        avg_conf_correct = np.mean(all_conf_correct) if all_conf_correct else 0
+        avg_conf_incorrect = np.mean(all_conf_incorrect) if all_conf_incorrect else 0
         
         print(f"\n{system_name}:")
         print(f"  Average Accuracy: {avg_accuracy:.1%}")
         print(f"  Average Tool Calls: {avg_tools:.1f}")
+        print(f"  Average Latency: {avg_latency:.2f}s")
+        print(f"  Avg Confidence (Correct): {avg_conf_correct:.3f}")
+        print(f"  Avg Confidence (Incorrect): {avg_conf_incorrect:.3f}")
         
         # Collect label-specific accuracies
         label_accs = {'bullshit': [], 'not_bullshit': [], 'contextually_ambiguous': []}
@@ -1126,8 +1218,13 @@ def run_full_evaluation(data_dir: str = "data"):
             if accs:
                 print(f"  {label.replace('_', ' ').title()} Accuracy: {np.mean(accs):.1%}")
     
+    # Generate filename with model name and date
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_name = "gemma-3-27b-it"  # Extract from chat model
+    
     # Save detailed results
-    output_path = Path("evaluation_results.json")
+    output_path = Path(f"evaluation_results_{model_name}_{timestamp}.json")
     with open(output_path, 'w') as f:
         # Convert numpy types to native Python for JSON serialization
         json_results = json.loads(json.dumps(all_results, default=lambda x: float(x) if isinstance(x, np.floating) else x))
@@ -1143,14 +1240,18 @@ def run_full_evaluation(data_dir: str = "data"):
                 'system': system_name,
                 'accuracy': result['accuracy'],
                 'avg_tool_calls': result['avg_tool_calls'],
+                'avg_latency_seconds': result.get('avg_latency_seconds', 0),
+                'avg_confidence_correct': result.get('avg_confidence_correct', 0),
+                'avg_confidence_incorrect': result.get('avg_confidence_incorrect', 0),
                 'context_usage_rate': result.get('context_usage_rate', 0),
                 **{f'{label}_accuracy': result.get('label_accuracy', {}).get(label, 0) 
-                   for label in ['bullshit', 'not_bullshit', 'contextually_ambiguous']}
+                   for label in ['bullshit', 'not_bullshit', 'contextually_ambiguous']},
+                **{f'cm_{k}': v for k, v in result.get('confusion_matrix', {}).items()}
             }
             summary_rows.append(row)
     
     summary_df = pd.DataFrame(summary_rows)
-    summary_path = Path("evaluation_summary.csv")
+    summary_path = Path(f"evaluation_summary_{model_name}_{timestamp}.csv")
     summary_df.to_csv(summary_path, index=False)
     print(f"✅ Summary CSV saved to {summary_path}")
     

@@ -39,7 +39,7 @@ nli_model.to(device)
 
 access_token = get_access_token()
 chat = ChatOpenAI(
-    model="google/gemma-3-27b-it",
+    model="meta-llama/Llama-3.3-70B-Instruct",#"google/gemma-3-27b-it",
     openai_api_key=access_token,
     openai_api_base="https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1",
 )
